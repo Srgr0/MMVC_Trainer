@@ -20,6 +20,16 @@ import pytz
 import time
 from tqdm import tqdm
 
+# 最適化モジュールのインポート
+try:
+    from optimizations.memory_optimizer import MemoryOptimizer, optimize_torch_settings
+    from optimizations.dataloader_optimizer import OptimizedDataLoader, BatchProcessor
+    from optimizations.training_optimizer import TrainingOptimizer, LossComputation
+    OPTIMIZATIONS_AVAILABLE = True
+except ImportError:
+    print("Warning: Optimization modules not found. Running without optimizations.")
+    OPTIMIZATIONS_AVAILABLE = False
+
 
 import commons
 import utils
@@ -66,6 +76,12 @@ def main():
 def run(rank, n_gpus, hps):
   global global_step
   
+  # 最適化設定の初期化
+  if OPTIMIZATIONS_AVAILABLE:
+    optimize_torch_settings()
+    memory_optimizer = MemoryOptimizer()
+    training_optimizer = TrainingOptimizer(mixed_precision=hps.train.fp16_run)
+  
   if hps.others.os_type == "windows":
     backend_type = "gloo"
     parallel = DP
@@ -80,9 +96,22 @@ def run(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
+  # CPU使用量の最適化
   cpu_count = os.cpu_count()
   if cpu_count > 8:
     cpu_count = 8
+  
+  # メモリ効率化のためのワーカー数調整
+  if OPTIMIZATIONS_AVAILABLE:
+    memory_info = memory_optimizer.optimize_dataloader_memory(
+      dataset_size=10000,  # 概算値
+      batch_size=hps.train.batch_size,
+      num_workers=cpu_count
+    )
+    cpu_count = memory_info['optimal_workers']
+    if rank == 0:
+      logger.info(f"Optimized settings: workers={cpu_count}, "
+                 f"available_memory={memory_info['available_memory_gb']}GB")
 
   if not hasattr(hps.model, "use_mel_train"):
     hps.model.use_mel_train = False
@@ -95,6 +124,7 @@ def run(rank, n_gpus, hps):
   dist.init_process_group(backend=backend_type, init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
+  
   train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data, augmentation=hps.augmentation.enable, augmentation_params=hps.augmentation)
   train_sampler = DistributedBucketSampler(
       train_dataset,
@@ -104,8 +134,26 @@ def run(rank, n_gpus, hps):
       rank=rank,
       shuffle=True)
   collate_fn = TextAudioSpeakerCollate()
-  train_loader = DataLoader(train_dataset, num_workers=cpu_count, shuffle=False, pin_memory=True,
-      collate_fn=collate_fn, batch_sampler=train_sampler)
+  
+  # 最適化されたDataLoader設定
+  dataloader_kwargs = {
+      'num_workers': cpu_count, 
+      'shuffle': False, 
+      'pin_memory': True,
+      'collate_fn': collate_fn, 
+      'batch_sampler': train_sampler,
+      'prefetch_factor': 2,
+      'persistent_workers': True if cpu_count > 0 else False
+  }
+  
+  # PyTorchバージョンチェック
+  try:
+      train_loader = DataLoader(train_dataset, **dataloader_kwargs)
+  except TypeError:
+      # 古いPyTorchバージョンの場合
+      dataloader_kwargs.pop('prefetch_factor', None)
+      dataloader_kwargs.pop('persistent_workers', None)
+      train_loader = DataLoader(train_dataset, **dataloader_kwargs)
   if rank == 0:
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data, augmentation=False)
     eval_sampler = DistributedBucketSampler(
@@ -223,22 +271,37 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
       with autocast(enabled=False):
-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+        # 最適化された損失計算
+        if OPTIMIZATIONS_AVAILABLE:
+          loss_mel = LossComputation.compute_mel_loss_efficient(y_mel, y_hat_mel) * hps.train.c_mel
+        else:
+          loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+        
         dispose_length = y_mel.size(2) // 4
         disposed_y_mel = y_mel[:, :, dispose_length:-dispose_length]
         disposed_vc_o_r_hat_mel = vc_o_r_hat_mel[:, :, dispose_length:-dispose_length]
         loss_vc = F.l1_loss(disposed_y_mel, disposed_vc_o_r_hat_mel) * hps.train.c_mel # melを真ん中の半分だけ使うようにする
-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-        loss_fm = feature_loss(fmap_r, fmap_g)
+        
+        if OPTIMIZATIONS_AVAILABLE:
+          loss_kl = LossComputation.compute_kl_loss_stable(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+          loss_fm = LossComputation.compute_feature_loss_efficient(fmap_r, fmap_g)
+        else:
+          loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+          loss_fm = feature_loss(fmap_r, fmap_g)
+        
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_vc + loss_kl
 
-    optim_g.zero_grad()
-    scaler.scale(loss_gen_all).backward()
-    scaler.unscale_(optim_g)
-    grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-    scaler.step(optim_g)
+    # 最適化されたオプティマイザステップ
+    if OPTIMIZATIONS_AVAILABLE:
+      step_stats = training_optimizer.optimize_step(net_g, optim_g, loss_gen_all)
+    else:
+      optim_g.zero_grad()
+      scaler.scale(loss_gen_all).backward()
+      scaler.unscale_(optim_g)
+      grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+      scaler.step(optim_g)
+    
     scaler.update()
 
     if rank==0:

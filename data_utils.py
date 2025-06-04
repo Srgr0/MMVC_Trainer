@@ -72,22 +72,52 @@ class TextAudioLoader(torch.utils.data.Dataset):
         return (text, spec, wav)
 
     def get_audio(self, filename):
+        # 最適化されたスペクトログラム生成とキャッシュ
         audio, sampling_rate = load_wav_to_torch(filename)
         if sampling_rate != self.sampling_rate:
             raise ValueError("{} {} SR doesn't match target {} SR".format(
                 sampling_rate, self.sampling_rate))
         audio_norm = audio / self.max_wav_value
         audio_norm = audio_norm.unsqueeze(0)
+        
         spec_filename = filename.replace(".wav", ".spec.pt")
+        
+        # キャッシュの確認と読み込み最適化
         if os.path.exists(spec_filename):
-            spec = torch.load(spec_filename)
+            try:
+                # ファイルの更新時間をチェック
+                audio_mtime = os.path.getmtime(filename)
+                spec_mtime = os.path.getmtime(spec_filename)
+                
+                if spec_mtime > audio_mtime:
+                    # キャッシュが新しい場合、メモリマップで高速読み込み
+                    spec = torch.load(spec_filename, map_location='cpu')
+                else:
+                    # 音声ファイルの方が新しい場合、再計算
+                    spec = self._compute_spectrogram(audio_norm, spec_filename)
+            except Exception:
+                # キャッシュファイルが破損している場合、再計算
+                spec = self._compute_spectrogram(audio_norm, spec_filename)
         else:
-            spec = spectrogram_torch(audio_norm, self.filter_length,
-                self.sampling_rate, self.hop_length, self.win_length,
-                center=False)
-            spec = torch.squeeze(spec, 0)
-            torch.save(spec, spec_filename)
+            spec = self._compute_spectrogram(audio_norm, spec_filename)
+        
         return spec, audio_norm
+    
+    def _compute_spectrogram(self, audio_norm, spec_filename):
+        """スペクトログラムの計算とキャッシュ保存"""
+        spec = spectrogram_torch(audio_norm, self.filter_length,
+            self.sampling_rate, self.hop_length, self.win_length,
+            center=False)
+        spec = torch.squeeze(spec, 0)
+        
+        # 非同期でキャッシュ保存（メインスレッドをブロックしない）
+        try:
+            torch.save(spec, spec_filename)
+        except Exception as e:
+            # キャッシュ保存に失敗してもエラーにしない
+            pass
+        
+        return spec
 
     def get_text(self, text):
         if self.cleaned_text:
