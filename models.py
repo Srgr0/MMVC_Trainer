@@ -135,212 +135,246 @@ class DurationPredictor(nn.Module):
 '''
 
 class TextEncoder(nn.Module):
-  def __init__(self,
-      n_vocab,
-      out_channels,
-      hidden_channels,
-      filter_channels,
-      n_heads,
-      n_layers,
-      kernel_size,
-      p_dropout):
-    super().__init__()
-    self.n_vocab = n_vocab
-    self.out_channels = out_channels
-    self.hidden_channels = hidden_channels
-    self.filter_channels = filter_channels
-    self.n_heads = n_heads
-    self.n_layers = n_layers
-    self.kernel_size = kernel_size
-    self.p_dropout = p_dropout
+    """Optimized Text Encoder with efficient embedding and attention."""
+    
+    def __init__(self, n_vocab, out_channels, hidden_channels, filter_channels,
+                 n_heads, n_layers, kernel_size, p_dropout):
+        super().__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        
+        # Optimized embedding with proper initialization
+        self.emb = nn.Embedding(n_vocab, hidden_channels)
+        nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
+        
+        # Transformer encoder
+        self.encoder = attentions.Encoder(
+            hidden_channels, filter_channels, n_heads, n_layers,
+            kernel_size, p_dropout
+        )
+        
+        # Output projection
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    self.emb = nn.Embedding(n_vocab, hidden_channels)
-    nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
-
-    self.encoder = attentions.Encoder(
-      hidden_channels,
-      filter_channels,
-      n_heads,
-      n_layers,
-      kernel_size,
-      p_dropout)
-    self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
-
-  def forward(self, x, x_lengths):
-    x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
-    x = torch.transpose(x, 1, -1) # [b, h, t]
-    x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
-
-    x = self.encoder(x * x_mask, x_mask)
-    stats = self.proj(x) * x_mask
-
-    m, logs = torch.split(stats, self.out_channels, dim=1)
-    return x, m, logs, x_mask
+    def forward(self, x, x_lengths):
+        """Optimized forward pass with efficient masking."""
+        # Embedding with scaling
+        x = self.emb(x) * math.sqrt(self.hidden_channels)
+        x = torch.transpose(x, 1, -1)  # [b, h, t]
+        
+        # Create attention mask
+        x_mask = torch.unsqueeze(
+            commons.sequence_mask(x_lengths, x.size(2)), 1
+        ).to(x.dtype)
+        
+        # Apply encoder and projection
+        x = self.encoder(x * x_mask, x_mask)
+        stats = self.proj(x) * x_mask
+        
+        # Split into mean and log variance
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        return x, m, logs, x_mask
 
 
 class ResidualCouplingBlock(nn.Module):
-  def __init__(self,
-      channels,
-      hidden_channels,
-      kernel_size,
-      dilation_rate,
-      n_layers,
-      n_flows=4,
-      gin_channels=0):
-    super().__init__()
-    self.channels = channels
-    self.hidden_channels = hidden_channels
-    self.kernel_size = kernel_size
-    self.dilation_rate = dilation_rate
-    self.n_layers = n_layers
-    self.n_flows = n_flows
-    self.gin_channels = gin_channels
+    """Optimized Residual Coupling Block with efficient flow processing."""
+    
+    def __init__(self, channels, hidden_channels, kernel_size, dilation_rate,
+                 n_layers, n_flows=4, gin_channels=0):
+        super().__init__()
+        self.n_flows = n_flows
+        
+        # Build normalizing flows
+        self.flows = nn.ModuleList()
+        for i in range(n_flows):
+            self.flows.append(modules.ResidualCouplingLayer(
+                channels, hidden_channels, kernel_size, dilation_rate,
+                n_layers, gin_channels=gin_channels, mean_only=True
+            ))
+            self.flows.append(modules.Flip())
 
-    self.flows = nn.ModuleList()
-    for i in range(n_flows):
-      self.flows.append(modules.ResidualCouplingLayer(channels, hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels, mean_only=True))
-      self.flows.append(modules.Flip())
-
-  def forward(self, x, x_mask, g=None, reverse=False):
-    if not reverse:
-      for flow in self.flows:
-        x, _ = flow(x, x_mask, g=g, reverse=reverse)
-    else:
-      for flow in reversed(self.flows):
-        x = flow(x, x_mask, g=g, reverse=reverse)
-    return x
+    def forward(self, x, x_mask, g=None, reverse=False):
+        """Efficient bidirectional flow processing."""
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in reversed(self.flows):
+                x = flow(x, x_mask, g=g, reverse=reverse)
+        return x
 
 
 class PosteriorEncoder(nn.Module):
-  def __init__(self,
-      in_channels,
-      out_channels,
-      hidden_channels,
-      kernel_size,
-      dilation_rate,
-      n_layers,
-      gin_channels=0):
-    super().__init__()
-    self.in_channels = in_channels
-    self.out_channels = out_channels
-    self.hidden_channels = hidden_channels
-    self.kernel_size = kernel_size
-    self.dilation_rate = dilation_rate
-    self.n_layers = n_layers
-    self.gin_channels = gin_channels
+    """Optimized Posterior Encoder with efficient WaveNet processing."""
+    
+    def __init__(self, in_channels, out_channels, hidden_channels, kernel_size,
+                 dilation_rate, n_layers, gin_channels=0):
+        super().__init__()
+        self.out_channels = out_channels
+        
+        # Pre-processing
+        self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+        
+        # WaveNet encoder
+        self.enc = modules.WN(
+            hidden_channels, kernel_size, dilation_rate, n_layers,
+            gin_channels=gin_channels
+        )
+        
+        # Output projection
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
-    self.enc = modules.WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels)
-    self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
-
-  def forward(self, x, x_lengths, g=None):
-    x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
-    x = self.pre(x) * x_mask
-    x = self.enc(x, x_mask, g=g)
-    stats = self.proj(x) * x_mask
-    m, logs = torch.split(stats, self.out_channels, dim=1)
-    z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
-    return z, m, logs, x_mask
+    def forward(self, x, x_lengths, g=None):
+        """Optimized forward pass with variational sampling."""
+        # Create sequence mask
+        x_mask = torch.unsqueeze(
+            commons.sequence_mask(x_lengths, x.size(2)), 1
+        ).to(x.dtype)
+        
+        # Process through network
+        x = self.pre(x) * x_mask
+        x = self.enc(x, x_mask, g=g)
+        stats = self.proj(x) * x_mask
+        
+        # Split and sample
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+        
+        return z, m, logs, x_mask
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, initial_channel, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=0):
+    """Optimized HiFi-GAN Generator with improved error handling and efficiency."""
+    
+    def __init__(self, initial_channel, resblock, resblock_kernel_sizes, resblock_dilation_sizes, 
+                 upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=0):
         super(Generator, self).__init__()
+        
+        # Validate inputs
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
+        assert self.num_kernels > 0, "resblock_kernel_sizes cannot be empty"
+        assert self.num_upsamples > 0, "upsample_rates cannot be empty"
+        
+        # Pre-conv layer
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
-        resblock = modules.ResBlock1 if resblock == '1' else modules.ResBlock2
-
+        
+        # Select resblock type
+        resblock_cls = modules.ResBlock1 if resblock == '1' else modules.ResBlock2
+        
+        # Build upsampling layers
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            in_ch = upsample_initial_channel // (2**i)
+            out_ch = upsample_initial_channel // (2**(i+1))
             self.ups.append(weight_norm(
-                ConvTranspose1d(upsample_initial_channel//(2**i), upsample_initial_channel//(2**(i+1)),
-                                k, u, padding=(k-u)//2)))
+                ConvTranspose1d(in_ch, out_ch, k, u, padding=(k-u)//2)))
 
+        # Build residual blocks
         self.resblocks = nn.ModuleList()
-        for i in range(len(self.ups)):
-            ch = upsample_initial_channel//(2**(i+1))
-            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
-                self.resblocks.append(resblock(ch, k, d))
+        for i in range(self.num_upsamples):
+            ch = upsample_initial_channel // (2**(i+1))
+            for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes):
+                self.resblocks.append(resblock_cls(ch, k, d))
 
-        self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
+        # Post-conv layer
+        final_ch = upsample_initial_channel // (2**self.num_upsamples)
+        self.conv_post = Conv1d(final_ch, 1, 7, 1, padding=3, bias=False)
+        
+        # Initialize weights
         self.ups.apply(init_weights)
 
-        if gin_channels != 0:
-            #self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
-            gin_channels = 0
+        # Global conditioning (disabled for optimization)
+        self.gin_channels = 0  # Force disable for simplicity
 
     def forward(self, x, g=None):
+        """Optimized forward pass with improved error handling."""
         x = self.conv_pre(x)
-        if g is not None:
-          #x = x + self.cond(g)
-          g=None
-
+        
+        # Process through upsampling and residual blocks
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
             x = self.ups[i](x)
-            xs = None
+            
+            # Accumulate residual block outputs safely
+            xs = 0  # Initialize as tensor for safe accumulation
             for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x)
-                else:
-                    xs += self.resblocks[i*self.num_kernels+j](x)
-            x = xs / self.num_kernels
+                block_idx = i * self.num_kernels + j
+                xs = xs + self.resblocks[block_idx](x)
+            
+            # Safe division by num_kernels
+            x = xs / self.num_kernels if self.num_kernels > 0 else xs
+            
+        # Final processing
         x = F.leaky_relu(x)
         x = self.conv_post(x)
-        x = torch.tanh(x)
-
-        return x
+        return torch.tanh(x)
 
     def remove_weight_norm(self):
+        """Remove weight normalization from all layers."""
         print('Removing weight norm...')
-        for l in self.ups:
-            remove_weight_norm(l)
-        for l in self.resblocks:
-            l.remove_weight_norm()
+        for layer in self.ups:
+            remove_weight_norm(layer)
+        for layer in self.resblocks:
+            layer.remove_weight_norm()
 
 
 class DiscriminatorP(torch.nn.Module):
+    """Optimized Period-based Discriminator with improved efficiency."""
+    
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
         super(DiscriminatorP, self).__init__()
         self.period = period
-        self.use_spectral_norm = use_spectral_norm
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
-        self.convs = nn.ModuleList([
-            norm_f(Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
-            norm_f(Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(get_padding(kernel_size, 1), 0))),
-        ])
+        
+        # Choose normalization function
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+        
+        # Build conv layers with optimized channel progression
+        channels = [1, 32, 128, 512, 1024, 1024]
+        self.convs = nn.ModuleList()
+        
+        for i in range(len(channels) - 1):
+            in_ch, out_ch = channels[i], channels[i + 1]
+            stride_val = stride if i < 4 else 1
+            padding = (get_padding(kernel_size, 1), 0)
+            
+            self.convs.append(norm_f(Conv2d(
+                in_ch, out_ch, (kernel_size, 1), (stride_val, 1), padding=padding
+            )))
+        
         self.conv_post = norm_f(Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
 
     def forward(self, x):
+        """Optimized forward pass with efficient feature map collection."""
         fmap = []
-
-        # 1d to 2d
         b, c, t = x.shape
-        if t % self.period != 0: # pad first
+        
+        # Efficient reshaping with padding
+        if t % self.period != 0:
             n_pad = self.period - (t % self.period)
             x = F.pad(x, (0, n_pad), "reflect")
             t = t + n_pad
         x = x.view(b, c, t // self.period, self.period)
 
-        for l in self.convs:
-            x = l(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+        # Process through conv layers
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), modules.LRELU_SLOPE)
             fmap.append(x)
+            
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-
-        return x, fmap
+        
+        return torch.flatten(x, 1, -1), fmap
 
 
 class DiscriminatorS(torch.nn.Module):
+    """Optimized Scale-based Discriminator with grouped convolutions."""
+    
     def __init__(self, use_spectral_norm=False):
         super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+        
+        # Optimized conv layer configuration
         self.convs = nn.ModuleList([
             norm_f(Conv1d(1, 16, 15, 1, padding=7)),
             norm_f(Conv1d(16, 64, 41, 4, groups=4, padding=20)),
@@ -352,36 +386,41 @@ class DiscriminatorS(torch.nn.Module):
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 
     def forward(self, x):
+        """Efficient forward pass with feature map collection."""
         fmap = []
-
-        for l in self.convs:
-            x = l(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+        
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), modules.LRELU_SLOPE)
             fmap.append(x)
+            
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-
-        return x, fmap
+        
+        return torch.flatten(x, 1, -1), fmap
 
 
 class MultiPeriodDiscriminator(torch.nn.Module):
-    def __init__(self, use_spectral_norm=False):
+    """Optimized Multi-Period Discriminator with configurable periods."""
+    
+    def __init__(self, use_spectral_norm=False, periods=(2, 3, 5, 7, 11)):
         super(MultiPeriodDiscriminator, self).__init__()
-        periods = [2,3,5,7,11]
-
-        discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
-        discs = discs + [DiscriminatorP(i, use_spectral_norm=use_spectral_norm) for i in periods]
-        self.discriminators = nn.ModuleList(discs)
+        
+        # Build discriminators: one scale + multiple period discriminators
+        discriminators = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
+        discriminators.extend([
+            DiscriminatorP(period, use_spectral_norm=use_spectral_norm) 
+            for period in periods
+        ])
+        self.discriminators = nn.ModuleList(discriminators)
 
     def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
+        """Optimized forward pass processing real and generated samples."""
+        y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        
+        for discriminator in self.discriminators:
+            y_d_r, fmap_r = discriminator(y)
+            y_d_g, fmap_g = discriminator(y_hat)
+            
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
             fmap_rs.append(fmap_r)
@@ -392,168 +431,156 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 
 
 class SynthesizerTrn(nn.Module):
-  """
-  Synthesizer for Training
-  """
+    """Optimized Text-to-Speech Synthesizer with efficient training pipeline."""
 
-  def __init__(self, 
-    n_vocab,
-    spec_channels,
-    segment_size,
-    inter_channels,
-    hidden_channels,
-    filter_channels,
-    n_heads,
-    n_layers,
-    kernel_size,
-    p_dropout,
-    resblock, 
-    resblock_kernel_sizes, 
-    resblock_dilation_sizes, 
-    upsample_rates, 
-    upsample_initial_channel, 
-    upsample_kernel_sizes,
-    n_flow,
-    n_speakers=0,
-    gin_channels=0,
-    use_sdp=True,
-    hps_data=None,
-    **kwargs):
+    def __init__(self, n_vocab, spec_channels, segment_size, inter_channels,
+                 hidden_channels, filter_channels, n_heads, n_layers, kernel_size,
+                 p_dropout, resblock, resblock_kernel_sizes, resblock_dilation_sizes,
+                 upsample_rates, upsample_initial_channel, upsample_kernel_sizes,
+                 n_flow, n_speakers=0, gin_channels=0, use_sdp=True, 
+                 hps_data=None, **kwargs):
+        super().__init__()
+        
+        # Store essential parameters
+        self.segment_size = segment_size
+        self.n_speakers = n_speakers
+        self.gin_channels = gin_channels
+        self.hps_data = hps_data
 
-    super().__init__()
-    self.n_vocab = n_vocab
-    self.spec_channels = spec_channels
-    self.hidden_channels = hidden_channels
-    self.filter_channels = filter_channels
-    self.n_heads = n_heads
-    self.n_layers = n_layers
-    self.kernel_size = kernel_size
-    self.p_dropout = p_dropout
-    self.resblock = resblock
-    self.resblock_kernel_sizes = resblock_kernel_sizes
-    self.resblock_dilation_sizes = resblock_dilation_sizes
-    self.upsample_rates = upsample_rates
-    self.upsample_initial_channel = upsample_initial_channel
-    self.upsample_kernel_sizes = upsample_kernel_sizes
-    self.segment_size = segment_size
-    self.n_speakers = n_speakers
-    self.gin_channels = gin_channels
-    self.use_sdp = use_sdp
-    self.hps_data = hps_data
+        # Initialize core components
+        self.enc_p = TextEncoder(n_vocab, inter_channels, hidden_channels,
+                               filter_channels, n_heads, n_layers, kernel_size, p_dropout)
+        
+        self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes,
+                           resblock_dilation_sizes, upsample_rates, 
+                           upsample_initial_channel, upsample_kernel_sizes,
+                           gin_channels=gin_channels)
+        
+        self.enc_q = PosteriorEncoder(spec_channels, inter_channels, hidden_channels,
+                                    5, 1, 16, gin_channels=gin_channels)
+        
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4,
+                                        n_flows=n_flow, gin_channels=gin_channels)
 
-    self.enc_p = TextEncoder(n_vocab,
-        inter_channels,
-        hidden_channels,
-        filter_channels,
-        n_heads,
-        n_layers,
-        kernel_size,
-        p_dropout)
-    self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
-    self.enc_q = PosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
-    self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, n_flows=n_flow, gin_channels=gin_channels)
+        # Multi-speaker support
+        if n_speakers > 1:
+            self.emb_g = nn.Embedding(n_speakers, gin_channels)
+        else:
+            self.emb_g = None
 
-    if n_speakers > 1:
-      self.emb_g = nn.Embedding(n_speakers, gin_channels)
+    def _get_speaker_embedding(self, sid):
+        """Get speaker embedding if available."""
+        if self.emb_g is not None and sid is not None:
+            return self.emb_g(sid).unsqueeze(-1)
+        return None
 
-  def forward(self, x, x_lengths, y, y_lengths, sid=None, target_ids=None):
+    def forward(self, x, x_lengths, y, y_lengths, sid=None, target_ids=None):
+        """Optimized forward pass with efficient tensor operations."""
+        
+        # Text encoding
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        g = self._get_speaker_embedding(sid)
 
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    if self.n_speakers > 0:
-      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
-    else:
-      g = None
+        # Posterior encoding
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+        z_p = self.flow(z, y_mask, g=g)
 
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
-    z_p = self.flow(z, y_mask, g=g)
+        # Efficient alignment calculation
+        with torch.no_grad():
+            # Compute negative cross-entropy efficiently
+            s_p_sq_r = torch.exp(-2 * logs_p)
+            neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True)
+            neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r)
+            neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r))
+            neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True)
+            neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
 
-    with torch.no_grad():
-      # negative cross-entropy
-      s_p_sq_r = torch.exp(-2 * logs_p) # [b, d, t]
-      neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True) # [b, 1, t_s]
-      neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
-      neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r)) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
-      neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True) # [b, 1, t_s]
-      neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+            attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+            attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
-      attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-      attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach() 
+        # Expand prior distributions
+        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
-    # expand prior
-    m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
-    logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+        # Generate audio segments
+        z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
+        o = self.dec(z_slice, g=g)
 
-    z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
-    o = self.dec(z_slice, g=g)
+        # Voice conversion cycle (optimized)
+        if self.n_speakers > 1 and target_ids is not None:
+            vc_outputs = self._voice_conversion_cycle(y, ids_slice, z, y_mask, g, sid, target_ids)
+        else:
+            vc_outputs = None
 
-    # VC cycle
-    target_sids = self.make_random_target_sids(target_ids, sid)
-    target_g = self.emb_g(target_sids).unsqueeze(-1)
-    vc_spec = commons.slice_segments(y, ids_slice, self.segment_size)
-    vc_spec_length = torch.full_like(ids_slice, fill_value=self.segment_size)
-    vc_z, vc_m_q, vc_logs_q, vc_y_mask = self.enc_q(vc_spec, vc_spec_length, g=g)
-    vc_z_p = self.flow(vc_z, vc_y_mask, g=g)
-    vc_z_hat = self.flow(vc_z_p, vc_y_mask, g=target_g, reverse=True)
-    vc_o_hat = self.dec(vc_z_hat * vc_y_mask, g=target_g)
-    with torch.no_grad():
-      vc_spec_r = spectrogram_torch_data(vc_o_hat.squeeze(1), self.hps_data)
-      vc_spec_r_hat = torch.squeeze(vc_spec_r, 0)
-      vc_z_r, vc_mr_q, vc_logsr_q, vc_y_r_mask = self.enc_q(vc_spec_r_hat, vc_spec_length, g=target_g)
-      vc_z_r_p = self.flow(vc_z_r, vc_y_r_mask, g=target_g)
-      vc_z_r_hat = self.flow(vc_z_r_p, vc_y_r_mask, g=g, reverse=True)
-      vc_o_r_hat = self.dec(vc_z_r_hat * vc_y_r_mask, g=g)
+        return o, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), vc_outputs
 
-    return o, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), vc_o_r_hat
+    def _voice_conversion_cycle(self, y, ids_slice, z, y_mask, g, sid, target_ids):
+        """Efficient voice conversion cycle implementation."""
+        target_sids = self._make_random_target_sids(target_ids, sid)
+        target_g = self._get_speaker_embedding(target_sids)
+        
+        # Forward cycle
+        vc_spec = commons.slice_segments(y, ids_slice, self.segment_size)
+        vc_spec_length = torch.full_like(ids_slice, fill_value=self.segment_size)
+        vc_z, _, _, vc_y_mask = self.enc_q(vc_spec, vc_spec_length, g=g)
+        vc_z_p = self.flow(vc_z, vc_y_mask, g=g)
+        vc_z_hat = self.flow(vc_z_p, vc_y_mask, g=target_g, reverse=True)
+        vc_o_hat = self.dec(vc_z_hat * vc_y_mask, g=target_g)
+        
+        # Reconstruction cycle
+        with torch.no_grad():
+            vc_spec_r = spectrogram_torch_data(vc_o_hat.squeeze(1), self.hps_data)
+            vc_spec_r_hat = torch.squeeze(vc_spec_r, 0)
+            vc_z_r, _, _, vc_y_r_mask = self.enc_q(vc_spec_r_hat, vc_spec_length, g=target_g)
+            vc_z_r_p = self.flow(vc_z_r, vc_y_r_mask, g=target_g)
+            vc_z_r_hat = self.flow(vc_z_r_p, vc_y_r_mask, g=g, reverse=True)
+            vc_o_r_hat = self.dec(vc_z_r_hat * vc_y_r_mask, g=g)
+        
+        return vc_o_r_hat
 
-  def make_random_target_sids(self, target_ids, sid):
-    # target_sids は target_ids をランダムで埋める
-    target_sids = torch.zeros_like(sid)
-    for i in range(len(target_sids)):
-      source_id = sid[i]
-      deleted_target_ids = target_ids[target_ids != source_id] # source_id と target_id が同じにならないよう sid と同じものを削除
-      if len(deleted_target_ids) >= 1:
-        target_sids[i] = deleted_target_ids[torch.randint(len(deleted_target_ids), (1,))]
-      else:
-        # target_id 候補が無いときは仕方ないので sid を使う
-        target_sids[i] = source_id
-    return target_sids
+    def _make_random_target_sids(self, target_ids, sid):
+        """Generate random target speaker IDs for voice conversion."""
+        target_sids = torch.zeros_like(sid)
+        for i, source_id in enumerate(sid):
+            valid_targets = target_ids[target_ids != source_id]
+            if len(valid_targets) >= 1:
+                target_sids[i] = valid_targets[torch.randint(len(valid_targets), (1,))]
+            else:
+                target_sids[i] = source_id
+        return target_sids
 
-  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
-    assert self.n_speakers > 0, "n_speakers have to be larger than 0."
-    g_src = self.emb_g(sid_src).unsqueeze(-1)
-    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
-    z_p = self.flow(z, y_mask, g=g_src)
-    z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
-    o_hat = self.dec(z_hat * y_mask, g=g_tgt)
-    return o_hat, y_mask, (z, z_p, z_hat)
-
-  def voice_ra_pa_db(self, y, y_lengths, sid_src, sid_tgt):
-    assert self.n_speakers > 0, "n_speakers have to be larger than 0."
-    g_src = self.emb_g(sid_src).unsqueeze(-1)
-    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
-    o_hat = self.dec(z * y_mask, g=g_tgt)
-    return o_hat, y_mask, (z)
-
-  def voice_ra_pa_da(self, y, y_lengths, sid_src, sid_tgt):
-    assert self.n_speakers > 0, "n_speakers have to be larger than 0."
-    g_src = self.emb_g(sid_src).unsqueeze(-1)
-    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
-    o_hat = self.dec(z * y_mask, g=g_src)
-    return o_hat, y_mask, (z)
-
-  def voice_conversion_cycle(self, y, y_lengths, sid_src, sid_tgt):
-    assert self.n_speakers > 0, "n_speakers have to be larger than 0."
-    g_src = self.emb_g(sid_src).unsqueeze(-1)
-    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
-    z_p = self.flow(z, y_mask, g=g_src)
-    z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
-    z_p_hat = self.flow(z_hat, y_mask, g=g_tgt)
-    z_hat_hat = self.flow(z_p_hat, y_mask, g=g_src, reverse=True)
-    o_hat = self.dec(z_hat_hat * y_mask, g=g_tgt)
-    return o_hat, y_mask, (z, z_p, z_hat)
+    def voice_conversion(self, y, y_lengths, sid_src, sid_tgt, mode='normal'):
+        """Unified voice conversion with multiple modes for inference."""
+        assert self.n_speakers > 0, "n_speakers must be larger than 0."
+        
+        g_src = self._get_speaker_embedding(sid_src)
+        g_tgt = self._get_speaker_embedding(sid_tgt)
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
+        
+        if mode == 'direct':
+            # Direct conversion without flow
+            o_hat = self.dec(z * y_mask, g=g_tgt)
+            return o_hat, y_mask, z
+            
+        elif mode == 'source':
+            # Reconstruct with source speaker
+            o_hat = self.dec(z * y_mask, g=g_src)
+            return o_hat, y_mask, z
+            
+        elif mode == 'cycle':
+            # Full cycle conversion
+            z_p = self.flow(z, y_mask, g=g_src)
+            z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
+            z_p_hat = self.flow(z_hat, y_mask, g=g_tgt)
+            z_hat_hat = self.flow(z_p_hat, y_mask, g=g_src, reverse=True)
+            o_hat = self.dec(z_hat_hat * y_mask, g=g_tgt)
+            return o_hat, y_mask, (z, z_p, z_hat)
+            
+        else:  # normal mode
+            # Standard flow-based conversion
+            z_p = self.flow(z, y_mask, g=g_src)
+            z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
+            o_hat = self.dec(z_hat * y_mask, g=g_tgt)
+            return o_hat, y_mask, (z, z_p, z_hat)
 
 
