@@ -6,13 +6,13 @@ phonemizer==2.2.1
 scipy
 tensorboard==2.3.0
 -f https://download.pytorch.org/whl/cu116/torch_stable.html
-torch==1.13.1+cu116
+torch==2.7.0
 torchvision==0.14.1+cu116
 torchaudio==0.13.1+cu116
 Unidecode==1.1.1
 retry
 tqdm
 resampy==0.2.2
-onnx==1.14.0
+onnx==1.17.0
 onnxsim==0.4.30
 onnxruntime==1.15.0
