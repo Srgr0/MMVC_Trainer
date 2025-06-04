@@ -41,6 +41,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Import monotonic_align with fallback
+try:
+    from monotonic_align_fallback import safe_import_monotonic_align
+    MONOTONIC_ALIGN_SUCCESS, monotonic_align_module, monotonic_align_error = safe_import_monotonic_align()
+    if not MONOTONIC_ALIGN_SUCCESS:
+        logger.warning(f"monotonic_align fallback activated: {monotonic_align_error}")
+    else:
+        logger.info("monotonic_align standard module loaded successfully")
+except ImportError:
+    logger.error("monotonic_align_fallback module not found")
+    MONOTONIC_ALIGN_SUCCESS = False
+    monotonic_align_module = None
+    monotonic_align_error = "Fallback module not available"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training_optimized.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training_optimized.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 class OptimizedMMVCTrainer:
     """Fully optimized MMVC trainer with all enhancements integrated."""
