@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "Cython"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmvc-trainer"
+version = "1.3.2.12"
+description = "MMVC (RealTime-Many to Many Voice Conversion) Trainer"
+authors = [{name = "MMVC Team"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8,<3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+]
+
+dependencies = [
+    "torch>=1.13.1",
+    "torchaudio>=0.13.1",
+    "scipy>=1.7.3",
+    "numpy>=1.21.6",
+    "librosa>=0.8.0",
+    "pyopenjtalk>=0.3.0",
+    "Cython>=0.29.21",
+    "matplotlib>=3.3.1",
+    "tensorboard>=2.3.0",
+    "tqdm",
+    "resampy>=0.2.2",
+    "onnx>=1.14.0",
+    "onnxsim>=0.4.30",
+    "onnxruntime>=1.15.0",
+    "psutil",
+    "unidecode>=1.3.6",
+    "protobuf>=3.20.1"
+]
+
+[project.scripts]
+mmvc-train = "src.cli.train:main"
+mmvc-preprocess = "src.cli.preprocess:main"
+mmvc-convert = "src.cli.convert:main"
+mmvc-export = "src.cli.export:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.pyx", "*.pxd"]
